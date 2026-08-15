@@ -1,0 +1,13 @@
+﻿R4Pack provenance
+=================
+
+Fachliche Quelle:
+- Eingefrorener Altprojekt-Commit: 259cbfac272c47ac1a7828de973512d17b29ae10
+- Modulpfad: Code/System/Software/R4Code/Modules/R4Pack
+- Kernpfad: Code/System/Software/R4Code/Shared/r4pack_core.zig
+
+Transfer in R4OS 0.64.18:
+- Modulquellen, Manifest und der fachlich zugehoerige gemeinsame Kern wurden
+  bytegenau aus dem eingefrorenen Commit uebernommen.
+- Der Kern besitzt hier seine einzige neue Repositorywahrheit und wird als
+  benannter Zig-Paketpfad fuer R4Build exportiert.
