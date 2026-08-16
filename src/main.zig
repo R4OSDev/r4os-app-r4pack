@@ -750,7 +750,7 @@ const App = struct {
         if (!self.pack(opts)) return 1;
         if (!self.inspectFile(out_path)) return 1;
         if (!self.inspectFile(self_path)) return 1;
-        if (!self.inspectFile("C:\\R4OS\\LIBS\\R4SYS.R4L")) return 1;
+        if (!self.inspectFile("C:\\R4OS\\LIBS\\R4STD.R4L")) return 1;
         self.logLine("R4PACK result: OK");
         return 0;
     }
