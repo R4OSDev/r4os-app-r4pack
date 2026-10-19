@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const R4M_HEADER_SIZE: usize = 64;
@@ -25,6 +26,9 @@ const R4M_RELOC_BASE_REL64: u32 = 3;
 const R4M_RELOC_IMPORT_SLOT64: u32 = 4;
 
 const max_file_bytes: usize = 64 * 1024;
+// Inspection is independent of the CLI pack/input limit. Even this tool's
+// own module may grow beyond64 KiB; allocate only the actual bounded file.
+const max_inspect_bytes: usize = 16 * 1024 * 1024;
 const max_sections: usize = 4;
 // Inspektion akzeptiert zusaetzlich die non-alloc-Section .rsrc (0.61.12);
 // der eigene CLI-Packpfad erzeugt weiterhin hoechstens vier Sections.
@@ -95,6 +99,7 @@ const InputSection = struct {
 };
 
 const Options = struct {
+    serial: bool = false,
     out: []const u8 = "",
     kind: ModuleKind = .r4x,
     app_class: AppClass = .auto,
@@ -125,10 +130,13 @@ const App = struct {
     log_buffer: [log_capacity]u8 = .{0} ** log_capacity,
     log_len: usize = 0,
     log_overflow: bool = false,
+    worker_count: usize = 0,
+    worker_cpu_mask: u64 = 0,
+    worker_roles_valid: bool = true,
 
     fn run(self: *App, args: []const u8) i32 {
         self.resetLog();
-        self.logLine("R4PACK 0.51.47");
+        self.logLine("R4PACK 0.1.5");
         if (args.len == 0 or equalsIgnoreCase(args, "HELP") or equalsIgnoreCase(args, "/?")) {
             self.printUsage();
             return 0;
@@ -145,6 +153,8 @@ const App = struct {
                     return 1;
                 };
                 return if (self.inspectFile(path_token.token)) 0 else 1;
+            } else if (equalsIgnoreCase(current.token, "--serial")) {
+                opts.serial = true;
             } else if (equalsIgnoreCase(current.token, "--output")) {
                 const value = takeToken(rest) orelse return self.badArgs("--output needs path");
                 opts.out = value.token;
@@ -229,6 +239,7 @@ const App = struct {
         self.logLine("  R4PACK.R4X --inspect <module.R4X|module.R4L>");
         self.logLine("  R4PACK.R4X --r4x --output <out.R4X> --code <code.bin> --app-class console --import R4SYS:Query:1 --export R4XStart:.text:0:1 --meta r4x.start=r4xstart");
         self.logLine("  R4PACK.R4X /SELFTEST");
+        self.logLine("  --serial keeps independent input preparation on the caller");
     }
 
     fn pack(self: *App, opts: Options) bool {
@@ -245,8 +256,8 @@ const App = struct {
             return false;
         }
 
-        var payload_len: usize = 0;
-        const code = self.readPayloadFile(opts.code_path, &payload_len) orelse {
+        const inputs = self.prepareInputs(.{ opts.code_path, opts.rodata_path, opts.data_path }, !opts.serial);
+        const code = inputs[0] orelse {
             self.logPair("code read failed", opts.code_path);
             return false;
         };
@@ -254,14 +265,14 @@ const App = struct {
             self.logLine("error: empty code section");
             return false;
         }
-        const rodata = if (opts.rodata_path.len != 0) self.readPayloadFile(opts.rodata_path, &payload_len) orelse {
+        const rodata = inputs[1] orelse {
             self.logPair("rodata read failed", opts.rodata_path);
             return false;
-        } else self.payload_buffer[0..0];
-        const data = if (opts.data_path.len != 0) self.readPayloadFile(opts.data_path, &payload_len) orelse {
+        };
+        const data = inputs[2] orelse {
             self.logPair("data read failed", opts.data_path);
             return false;
-        } else self.payload_buffer[0..0];
+        };
 
         var sections: [max_sections]InputSection = undefined;
         var section_count: usize = 0;
@@ -503,10 +514,30 @@ const App = struct {
     }
 
     fn inspectFile(self: *App, path: []const u8) bool {
-        const bytes = self.readFile(path, self.image_buffer[0..]) orelse {
+        var path_z: [path_capacity]u8 = .{0} ** path_capacity;
+        if (!setZResult(&path_z, path)) return false;
+        const info = self.sys.fileInfo(zptr(&path_z)) orelse {
             self.logPair("inspect read failed", path);
             return false;
         };
+        const size: usize = @intCast(info.size);
+        if (info.exists == 0 or info.is_dir != 0 or size > max_inspect_bytes) {
+            self.logPair("inspect read failed", path);
+            return false;
+        }
+        const storage = self.sys.allocator().alloc(u8, size + 1) catch {
+            self.logPair("inspect read failed", path);
+            return false;
+        };
+        defer self.sys.allocator().free(storage);
+        const bytes = self.readFile(path, storage) orelse {
+            self.logPair("inspect read failed", path);
+            return false;
+        };
+        if (bytes.len != size) {
+            self.logPair("inspect read failed", path);
+            return false;
+        }
         return self.inspectImage(path, bytes);
     }
 
@@ -700,8 +731,27 @@ const App = struct {
         _ = self.ensureDirectory("C:\\TEMP");
         if (!self.ensureDirectory("C:\\TEMP\\R4PACK")) return 1;
 
-        var code_path_buf: [path_capacity]u8 = undefined;
-        var out_path_buf: [path_capacity]u8 = undefined;
+        var identity: r4os.abi.ProgramJoinHandle = .{};
+        if (self.sys.threadCurrentHandle(&identity) != r4os.abi.thread_ok) return 1;
+        var paths: [6][path_capacity:0]u8 = undefined;
+        for (&paths, 0..) |*path, index| {
+            _ = std.fmt.bufPrintZ(path, "C:\\TEMP\\R4PACK\\P-{d}-{x}-{d}.TMP", .{ identity.instance_id, identity.instance_generation, index }) catch return 1;
+        }
+        const files: r4os.app_storage.Files = .{ .sys = self.sys };
+        var owned = [_]bool{false} ** 5;
+        defer for (paths[0..owned.len], owned) |*path, present| {
+            if (present) _ = self.sys.fileDelete(path);
+        };
+        // Exclusive publication establishes ownership before any later normal
+        // pack/write can replace one of these exact private output paths.
+        const contents = [_][]const u8{ &.{ 0x31, 0xC0, 0xC3 }, "rodata", &.{ 1, 2, 3 }, "", "" };
+        for (paths[0..owned.len], contents, 0..) |*path, content, index| {
+            if (!createProbeFile(files, path, content)) return 1;
+            owned[index] = true;
+        }
+        if (self.sys.fileInfo(&paths[5])) |info| {
+            if (info.exists != 0) return 1;
+        }
         var module_name_buf: [32]u8 = undefined;
         var import_module_buf: [16]u8 = undefined;
         var import_symbol_buf: [16]u8 = undefined;
@@ -709,13 +759,8 @@ const App = struct {
         var section_name_buf: [16]u8 = undefined;
         var meta_buffers: [7][64]u8 = undefined;
 
-        const code_path = copyText(code_path_buf[0..], "C:\\TEMP\\R4PACK\\CODE.BIN");
-        const out_path = copyText(out_path_buf[0..], "C:\\TEMP\\R4PACK\\PACKTEST.R4X");
-        const code = [_]u8{ 0x31, 0xC0, 0xC3 };
-        if (!self.writeFile(code_path, code[0..])) {
-            self.logLine("selftest code write failed");
-            return 1;
-        }
+        const code_path = std.mem.sliceTo(&paths[0], 0);
+        const out_path = std.mem.sliceTo(&paths[3], 0);
 
         var opts = Options{
             .out = out_path,
@@ -723,6 +768,9 @@ const App = struct {
             .app_class = .console,
             .module_name = copyText(module_name_buf[0..], "R4PACKTEST"),
             .code_path = code_path,
+            .rodata_path = std.mem.sliceTo(&paths[1], 0),
+            .data_path = std.mem.sliceTo(&paths[2], 0),
+            .serial = true,
         };
         opts.imports[0] = .{
             .module = copyText(import_module_buf[0..], "R4SYS"),
@@ -748,11 +796,81 @@ const App = struct {
         opts.metadata_count = 7;
 
         if (!self.pack(opts)) return 1;
+        const reference = self.sys.allocator().alloc(u8, max_file_bytes) catch return 1;
+        defer self.sys.allocator().free(reference);
+        const expected = self.readFile(out_path, reference) orelse return 1;
+        opts.out = std.mem.sliceTo(&paths[4], 0);
+        opts.serial = false;
+        if (!self.pack(opts)) return 1;
+        const actual = self.readFile(opts.out, &self.image_buffer) orelse return 1;
+        if (!std.mem.eql(u8, expected, actual) or !self.worker_roles_valid) return 1;
+        var capacity: r4os.abi.CpuCapacity = .{};
+        if (self.sys.cpuCapacity(&capacity) != r4os.abi.thread_ok) return 1;
+        if (self.worker_count != 3 or (capacity.available_cpus > 1 and self.worker_cpu_mask & ~@as(u64, 1) == 0)) return 1;
+        var main_placement: r4os.abi.ThreadPlacementInfo = .{};
+        if (self.sys.threadPlacementGet(&identity, &main_placement, &.{}) != r4os.abi.thread_ok or main_placement.running_cpu != 0) return 1;
+        self.logWrite("R4PACK workers=");
+        self.logUsize(self.worker_count);
+        self.logWrite(" cpu-mask=");
+        self.logU64(self.worker_cpu_mask);
+        self.logLine(" main-cpu=0 identical=OK roles=OK joined=OK");
+        for (0..3) |missing_index| {
+            var input_paths = [_][]const u8{ code_path, opts.rodata_path, opts.data_path };
+            input_paths[missing_index] = std.mem.sliceTo(&paths[5], 0);
+            if (!self.sameInputFailure(input_paths, missing_index)) return 1;
+        }
+        if (!self.writeFile(code_path, "")) return 1;
+        const input_paths = [_][]const u8{ code_path, opts.rodata_path, opts.data_path };
+        const serial_empty = self.prepareInputs(input_paths, false)[0] orelse return 1;
+        if (serial_empty.len != 0) return 1;
+        const parallel_empty = self.prepareInputs(input_paths, true)[0] orelse return 1;
+        if (parallel_empty.len != 0 or !self.writeFile(code_path, contents[0])) return 1;
+        // Two independently valid 32-KiB inputs exceed the original aggregate
+        // limit together with code; only the data section must be refused.
+        @memset(self.payload_buffer[0 .. 32 * 1024], 0x5A);
+        if (!self.writeFile(opts.rodata_path, self.payload_buffer[0 .. 32 * 1024]) or
+            !self.writeFile(opts.data_path, self.payload_buffer[0 .. 32 * 1024])) return 1;
+        if (!self.sameInputFailure(.{ code_path, opts.rodata_path, opts.data_path }, 2)) return 1;
+        self.logLine("R4PACK input errors=5 serial-order=OK empty-code=OK aggregate-limit=OK");
         if (!self.inspectFile(out_path)) return 1;
+        if (!self.inspectFile(opts.out)) return 1;
         if (!self.inspectFile(self_path)) return 1;
         if (!self.inspectFile("C:\\R4OS\\LIBS\\R4STD.R4L")) return 1;
+        for (paths[0..owned.len], 0..) |*path, index| {
+            const path_len: u16 = @intCast(std.mem.sliceTo(path, 0).len);
+            if (files.delete(.{ .ptr = path, .len = path_len }) != .ok) {
+                self.logPair("selftest cleanup failed", std.mem.sliceTo(path, 0));
+                return 1;
+            }
+            owned[index] = false;
+            if (files.info(.{ .ptr = path, .len = path_len }) != .missing) return 1;
+        }
+        self.logLine("R4PACK private files cleanup=OK");
         self.logLine("R4PACK result: OK");
         return 0;
+    }
+
+    fn createProbeFile(files: r4os.app_storage.Files, path: *[path_capacity:0]u8, content: []const u8) bool {
+        var writer = switch (files.streamWriter(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) }, r4os.abi.file_stream_open_create)) {
+            .writer => |value| value,
+            .failure => return false,
+        };
+        if (writer.write(content) == .ok and writer.finish() == .ok) return true;
+        _ = writer.abort();
+        return false;
+    }
+
+    fn sameInputFailure(self: *App, paths: [3][]const u8, first_error: usize) bool {
+        const serial = self.prepareInputs(paths, false);
+        var lengths: [3]?usize = .{null} ** 3;
+        for (serial, 0..) |item, index| lengths[index] = if (item) |bytes| bytes.len else null;
+        const parallel = self.prepareInputs(paths, true);
+        for (parallel, 0..) |item, index| {
+            const len: ?usize = if (item) |bytes| bytes.len else null;
+            if (lengths[index] != len or (index < first_error and len == null) or
+                (index == first_error and len != null)) return false;
+        }
+        return true;
     }
 
     fn readFile(self: *App, path: []const u8, out: []u8) ?[]const u8 {
@@ -771,6 +889,107 @@ const App = struct {
         const bytes = self.readFile(path, self.payload_buffer[start..]) orelse return null;
         payload_len.* += bytes.len;
         return self.payload_buffer[start..payload_len.*];
+    }
+
+    const InputJob = struct {
+        sys: r4os.r4sys.Context,
+        path: []const u8,
+        buffer: [max_file_bytes]u8 = undefined,
+        len: ?usize = null,
+        handle: r4os.abi.ProgramJoinHandle = .{},
+        cpu: u32 = r4os.abi.thread_placement_cpu_none,
+        compute_role: bool = false,
+
+        fn read(self: *InputJob) void {
+            var path_z: [path_capacity]u8 = .{0} ** path_capacity;
+            if (!setZResult(&path_z, self.path)) return;
+            const count = self.sys.fileRead(zptr(&path_z), &self.buffer);
+            if (count < 0) return;
+            const len: usize = @intCast(count);
+            if (len >= self.buffer.len) return;
+            self.len = len;
+        }
+
+        fn run(raw: u64) callconv(.c) i32 {
+            const self: *InputJob = @ptrFromInt(raw);
+            var handle: r4os.abi.ProgramJoinHandle = .{};
+            var info: r4os.abi.ProgramThreadInfo = .{};
+            if (self.sys.threadCurrentHandle(&handle) == r4os.abi.thread_ok and
+                self.sys.threadHandleStatus(&handle, &info) == r4os.abi.thread_ok)
+                self.compute_role = info.flags & r4os.abi.thread_flag_compute_worker != 0 and
+                    info.flags & r4os.abi.thread_flag_main == 0;
+            self.read();
+            var placement: r4os.abi.ThreadPlacementInfo = .{};
+            if (self.sys.threadPlacementGet(&handle, &placement, &.{}) == r4os.abi.thread_ok)
+                self.cpu = placement.running_cpu;
+            return 0;
+        }
+    };
+
+    fn prepareInputs(self: *App, paths: [3][]const u8, parallel: bool) [3]?[]const u8 {
+        self.worker_count = 0;
+        self.worker_cpu_mask = 0;
+        self.worker_roles_valid = true;
+        var result: [3]?[]const u8 = .{null} ** 3;
+        var payload_len: usize = 0;
+        // No independent input exists for the ordinary code-only command.
+        if (!parallel or (paths[1].len == 0 and paths[2].len == 0)) {
+            for (paths, 0..) |path, index| {
+                result[index] = if (path.len == 0) self.payload_buffer[0..0] else self.readPayloadFile(path, &payload_len);
+                if (result[index] == null) break;
+            }
+            return result;
+        }
+        const allocator = self.sys.allocator();
+        const jobs = allocator.alloc(InputJob, paths.len) catch return self.prepareInputs(paths, false);
+        var joined = true;
+        // An unconfirmed join retains every buffer until process teardown has
+        // actually stopped its workers; it never frees an in-flight pointer.
+        defer if (joined) allocator.free(jobs);
+        for (paths, 0..) |path, index| {
+            jobs[index] = .{ .sys = self.sys, .path = path };
+            if (path.len == 0) continue;
+            const rc = self.sys.computeWorkerCreate(InputJob.run, @intFromPtr(&jobs[index]), 256 * 1024, &jobs[index].handle);
+            if (rc == r4os.abi.thread_ok) {
+                self.worker_count += 1;
+            } else {
+                // The old provider/UP contract and resource refusal retain a
+                // correct serial preparation without a hidden worker pool.
+                jobs[index].handle = .{};
+                jobs[index].read();
+            }
+        }
+        for (jobs) |*job| {
+            if (job.handle.thread_id == 0) continue;
+            var exit_code: i32 = -1;
+            if (self.sys.threadHandleJoin(&job.handle, self.sys.ticksFromMilliseconds(10_000), &exit_code) != r4os.abi.thread_ok or exit_code != 0) {
+                joined = false;
+            } else {
+                self.worker_roles_valid = self.worker_roles_valid and job.compute_role;
+                if (job.cpu < 64) self.worker_cpu_mask |= @as(u64, 1) << @intCast(job.cpu);
+            }
+        }
+        if (!joined) {
+            // Job contexts also borrow the caller's R4App bundle. Keep this
+            // entire call frame alive; normal return/deinit is not a stop ACK.
+            self.logLine("error: worker join unconfirmed; stopping process");
+            _ = self.sys.programExit(1, r4os.abi.program_exit_reason_failed);
+            while (true) self.sys.sleepTicks(1);
+        }
+        // Preserve the original code/rodata/data order, strict aggregate limit
+        // and first error, regardless of worker completion order.
+        for (jobs, 0..) |*job, index| {
+            if (job.path.len == 0) {
+                result[index] = self.payload_buffer[0..0];
+                continue;
+            }
+            const len = job.len orelse break;
+            if (len >= self.payload_buffer.len - payload_len) break;
+            @memcpy(self.payload_buffer[payload_len..][0..len], job.buffer[0..len]);
+            result[index] = self.payload_buffer[payload_len..][0..len];
+            payload_len += len;
+        }
+        return result;
     }
 
     fn writeFile(self: *App, path: []const u8, data: []const u8) bool {
