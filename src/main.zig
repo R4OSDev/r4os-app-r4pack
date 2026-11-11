@@ -44,11 +44,19 @@ const log_dir = "C:\\SOFTWARE\\R4CODE\\LOGS";
 const log_path = "C:\\SOFTWARE\\R4CODE\\LOGS\\R4PACK.LOG";
 const self_path = "C:\\SOFTWARE\\R4CODE\\R4PACK.R4X";
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    var app = App{ .sys = r4_app.system() };
-    const rc = app.run(trim(zSlice(app.sys.argsRaw())));
+pub fn r4_app_main(root: *r4os.App2) i32 {
+    var output: r4os.launch_io.Output = undefined;
+    if (r4os.launch_io.Output.init(root, &output) != 0) return 1;
+    var app = App{ .root = root, .sys = root.system(), .output = &output };
+    app.records = r4os.diagnostics.core.BoundedDiagnosticBuffer.init(&app.record_storage) catch {
+        _ = output.close();
+        return 1;
+    };
+    const code = app.run(trim(root.args()));
     _ = app.flushLog();
-    return rc;
+    const close = output.close();
+    if (root.shouldClose()) return 0;
+    return if (code == 0 and (output.failed or close != 0)) 1 else code;
 }
 
 const ModuleKind = enum(u16) {
@@ -124,7 +132,11 @@ const Token = struct {
 };
 
 const App = struct {
+    root: *r4os.App2,
     sys: r4os.r4sys.Context,
+    output: *r4os.launch_io.Output,
+    record_storage: [log_capacity + 8]u8 = undefined,
+    records: r4os.diagnostics.core.BoundedDiagnosticBuffer = undefined,
     payload_buffer: [max_file_bytes]u8 = undefined,
     image_buffer: [max_file_bytes]u8 = undefined,
     log_buffer: [log_capacity]u8 = .{0} ** log_capacity,
@@ -136,7 +148,17 @@ const App = struct {
 
     fn run(self: *App, args: []const u8) i32 {
         self.resetLog();
-        self.logLine("R4PACK 0.1.5");
+        var failure: r4os.arguments.Failure = .{};
+        var cursor = r4os.arguments.ArgCursor.init(args, .{}, &failure) catch {
+            self.logLine("error: invalid UTF8 command line");
+            return 1;
+        };
+        while (cursor.next() catch {
+            self.logLine("error: invalid complete argument grammar");
+            return 1;
+        }) |_| {}
+
+        self.logLine("R4PACK 0.1.7");
         if (args.len == 0 or equalsIgnoreCase(args, "HELP") or equalsIgnoreCase(args, "/?")) {
             self.printUsage();
             return 0;
@@ -152,6 +174,7 @@ const App = struct {
                     self.logLine("error: --inspect needs path");
                     return 1;
                 };
+                if (trim(path_token.rest).len != 0) return self.badArgs("unexpected arguments after inspect path");
                 return if (self.inspectFile(path_token.token)) 0 else 1;
             } else if (equalsIgnoreCase(current.token, "--serial")) {
                 opts.serial = true;
@@ -237,7 +260,7 @@ const App = struct {
     fn printUsage(self: *App) void {
         self.logLine("usage:");
         self.logLine("  R4PACK.R4X --inspect <module.R4X|module.R4L>");
-        self.logLine("  R4PACK.R4X --r4x --output <out.R4X> --code <code.bin> --app-class console --import R4SYS:Query:1 --export R4XStart:.text:0:1 --meta r4x.start=r4xstart");
+        self.logLine("  R4PACK.R4X --r4x --output <out.R4X> --code <code.bin> --app-class console --import R4SYS:Query2:2 --import R4DESK:Query2:2 --export R4XStart2:.text:0:2 --meta r4x.start=r4xstart2");
         self.logLine("  R4PACK.R4X /SELFTEST");
         self.logLine("  --serial keeps independent input preparation on the caller");
     }
@@ -516,15 +539,13 @@ const App = struct {
     fn inspectFile(self: *App, path: []const u8) bool {
         var path_z: [path_capacity]u8 = .{0} ** path_capacity;
         if (!setZResult(&path_z, path)) return false;
-        const info = self.sys.fileInfo(zptr(&path_z)) orelse {
-            self.logPair("inspect read failed", path);
-            return false;
+        const info = switch (r4os.metadata2.info(&self.root.context, zptr(&path_z))) {
+            .found => |value| value,
+            else => return self.inspectFail(path, "metadata unavailable"),
         };
-        const size: usize = @intCast(info.size);
-        if (info.exists == 0 or info.is_dir != 0 or size > max_inspect_bytes) {
-            self.logPair("inspect read failed", path);
-            return false;
-        }
+        const size64 = r4os.metadata2.fileSize(&info) orelse return self.inspectFail(path, "file size unavailable");
+        if (info.flags & r4os.abi.file_metadata2_flag_directory != 0 or size64 > max_inspect_bytes) return self.inspectFail(path, "file size or kind");
+        const size: usize = @intCast(size64);
         const storage = self.sys.allocator().alloc(u8, size + 1) catch {
             self.logPair("inspect read failed", path);
             return false;
@@ -749,8 +770,9 @@ const App = struct {
             if (!createProbeFile(files, path, content)) return 1;
             owned[index] = true;
         }
-        if (self.sys.fileInfo(&paths[5])) |info| {
-            if (info.exists != 0) return 1;
+        switch (r4os.metadata2.info(&self.root.context, &paths[5])) {
+            .missing => {},
+            else => return 1,
         }
         var module_name_buf: [32]u8 = undefined;
         var import_module_buf: [16]u8 = undefined;
@@ -774,25 +796,25 @@ const App = struct {
         };
         opts.imports[0] = .{
             .module = copyText(import_module_buf[0..], "R4SYS"),
-            .symbol = copyText(import_symbol_buf[0..], "Query"),
-            .min_version = 1,
+            .symbol = copyText(import_symbol_buf[0..], "Query2"),
+            .min_version = 2,
             .flags = 0,
         };
         opts.import_count = 1;
         opts.exports[0] = .{
-            .name = copyText(export_name_buf[0..], "R4XStart"),
+            .name = copyText(export_name_buf[0..], "R4XStart2"),
             .section = copyText(section_name_buf[0..], ".text"),
             .offset = 0,
-            .version = 1,
+            .version = 2,
         };
         opts.export_count = 1;
         opts.metadata[0] = copyText(meta_buffers[0][0..], "r4x.name=R4PACKTEST");
         opts.metadata[1] = copyText(meta_buffers[1][0..], "r4x.class=console");
         opts.metadata[2] = copyText(meta_buffers[2][0..], "feature=program-module");
-        opts.metadata[3] = copyText(meta_buffers[3][0..], "r4x.start=r4xstart");
-        opts.metadata[4] = copyText(meta_buffers[4][0..], "r4x.entry=R4XStart");
-        opts.metadata[5] = copyText(meta_buffers[5][0..], "r4x.start_abi=1");
-        opts.metadata[6] = copyText(meta_buffers[6][0..], "r4x.context=R4XStartContext");
+        opts.metadata[3] = copyText(meta_buffers[3][0..], "r4x.start=r4xstart2");
+        opts.metadata[4] = copyText(meta_buffers[4][0..], "r4x.entry=R4XStart2");
+        opts.metadata[5] = copyText(meta_buffers[5][0..], "r4x.start_abi=2");
+        opts.metadata[6] = copyText(meta_buffers[6][0..], "r4x.context=R4XStartContext2");
         opts.metadata_count = 7;
 
         if (!self.pack(opts)) return 1;
@@ -873,14 +895,63 @@ const App = struct {
         return true;
     }
 
-    fn readFile(self: *App, path: []const u8, out: []u8) ?[]const u8 {
+    fn readMetadata(self: *App, path: []const u8, capacity: usize, restart: *bool) ?r4os.abi.FileMetadata2 {
         var path_z: [path_capacity]u8 = .{0} ** path_capacity;
-        if (!setZResult(path_z[0..], path)) return null;
-        const read = self.sys.fileRead(zptr(path_z[0..]), out);
-        if (read < 0) return null;
-        const len: usize = @intCast(read);
-        if (len >= out.len) return null;
-        return out[0..len];
+        if (!setZResult(&path_z, path)) return null;
+        const info = switch (r4os.metadata2.info(&self.root.context, zptr(&path_z))) {
+            .found => |value| value,
+            .failure => |code| {
+                restart.* = restart.* or code == r4os.abi.file_metadata2_error_restart;
+                return null;
+            },
+            else => return null,
+        };
+        const size = r4os.metadata2.fileSize(&info) orelse return null;
+        if (info.flags & r4os.abi.file_metadata2_flag_directory != 0 or size >= capacity) return null;
+        return info;
+    }
+
+    fn unchanged(self: *App, path: []const u8, before: r4os.abi.FileMetadata2, restart: *bool) bool {
+        const after = self.readMetadata(path, max_inspect_bytes + 1, restart) orelse return false;
+        if (r4os.metadata2.fileSize(&after) != r4os.metadata2.fileSize(&before)) {
+            restart.* = true;
+            return false;
+        }
+        if (r4os.metadata2.identity(&before)) |identity| {
+            const observed = r4os.metadata2.identity(&after) orelse return false;
+            if (!std.meta.eql(identity.*, observed.*)) {
+                restart.* = true;
+                return false;
+            }
+        }
+        return before.flags & r4os.abi.file_metadata2_flag_content_revision_valid == 0 or
+            (after.flags & r4os.abi.file_metadata2_flag_content_revision_valid != 0 and before.content_revision == after.content_revision);
+    }
+
+    fn readContents(self: *App, path: []const u8, size: u64, out: []u8, budget: *r4os.rpc_budget.Budget) ?[]const u8 {
+        if (size >= out.len) return null;
+        var path_z: [path_capacity]u8 = .{0} ** path_capacity;
+        if (!setZResult(&path_z, path)) return null;
+        var source = r4os.stream_transfer.adapters.FileRead.fromContext2(&self.root.context, zptr(&path_z), 0) catch return null;
+        const driver: r4os.stream_transfer.adapters.Driver = .{ .sys = self.sys, .clock = &self.output.clock, .budget = budget };
+        const progress = driver.read(out[0..@intCast(size)], 64 * 1024, r4os.stream_transfer.adapters.FileRead.step, &source, true) catch return null;
+        if (progress.outcome != @intFromEnum(r4os.stream_transfer.Outcome.complete) or progress.bytes != size) return null;
+        return out[0..@intCast(size)];
+    }
+
+    fn readFile(self: *App, path: []const u8, out: []u8) ?[]const u8 {
+        var budget = r4os.rpc_budget.Budget.fromTimeout(self.output.clock.read, .{ .kind = 1, .nanoseconds = 5_000_000_000 }) catch return null;
+        while (!self.root.shouldClose()) {
+            _ = budget.remainingTicks() catch return null;
+            var restart = false;
+            if (self.readMetadata(path, out.len, &restart)) |before| {
+                const bytes = self.readContents(path, before.byte_size, out, &budget) orelse return null;
+                if (self.unchanged(path, before, &restart)) return bytes;
+            }
+            if (!restart) return null;
+            self.sys.sleepTicks(0);
+        }
+        return null;
     }
 
     fn readPayloadFile(self: *App, path: []const u8, payload_len: *usize) ?[]const u8 {
@@ -892,8 +963,9 @@ const App = struct {
     }
 
     const InputJob = struct {
-        sys: r4os.r4sys.Context,
+        owner: *App,
         path: []const u8,
+        before: ?r4os.abi.FileMetadata2 = null,
         buffer: [max_file_bytes]u8 = undefined,
         len: ?usize = null,
         handle: r4os.abi.ProgramJoinHandle = .{},
@@ -901,26 +973,23 @@ const App = struct {
         compute_role: bool = false,
 
         fn read(self: *InputJob) void {
-            var path_z: [path_capacity]u8 = .{0} ** path_capacity;
-            if (!setZResult(&path_z, self.path)) return;
-            const count = self.sys.fileRead(zptr(&path_z), &self.buffer);
-            if (count < 0) return;
-            const len: usize = @intCast(count);
-            if (len >= self.buffer.len) return;
-            self.len = len;
+            const before = self.before orelse return;
+            var budget = r4os.rpc_budget.Budget.fromTimeout(self.owner.output.clock.read, .{ .kind = 1, .nanoseconds = 5_000_000_000 }) catch return;
+            const bytes = self.owner.readContents(self.path, before.byte_size, &self.buffer, &budget) orelse return;
+            self.len = bytes.len;
         }
 
         fn run(raw: u64) callconv(.c) i32 {
             const self: *InputJob = @ptrFromInt(raw);
             var handle: r4os.abi.ProgramJoinHandle = .{};
             var info: r4os.abi.ProgramThreadInfo = .{};
-            if (self.sys.threadCurrentHandle(&handle) == r4os.abi.thread_ok and
-                self.sys.threadHandleStatus(&handle, &info) == r4os.abi.thread_ok)
+            if (self.owner.sys.threadCurrentHandle(&handle) == r4os.abi.thread_ok and
+                self.owner.sys.threadHandleStatus(&handle, &info) == r4os.abi.thread_ok)
                 self.compute_role = info.flags & r4os.abi.thread_flag_compute_worker != 0 and
                     info.flags & r4os.abi.thread_flag_main == 0;
             self.read();
             var placement: r4os.abi.ThreadPlacementInfo = .{};
-            if (self.sys.threadPlacementGet(&handle, &placement, &.{}) == r4os.abi.thread_ok)
+            if (self.owner.sys.threadPlacementGet(&handle, &placement, &.{}) == r4os.abi.thread_ok)
                 self.cpu = placement.running_cpu;
             return 0;
         }
@@ -940,29 +1009,91 @@ const App = struct {
             }
             return result;
         }
+        var budget = r4os.rpc_budget.Budget.fromTimeout(self.output.clock.read, .{ .kind = 1, .nanoseconds = 10_000_000_000 }) catch return result;
+        while (!self.root.shouldClose()) {
+            _ = budget.remainingTicks() catch return result;
+            var restart = false;
+            const prepared = self.prepareParallelInputs(paths, &budget, &restart);
+            if (!restart) return prepared;
+            self.sys.sleepTicks(0);
+        }
+        return result;
+    }
+
+    fn prepareParallelInputs(self: *App, paths: [3][]const u8, budget: *r4os.rpc_budget.Budget, restart: *bool) [3]?[]const u8 {
+        self.worker_count = 0;
+        self.worker_cpu_mask = 0;
+        self.worker_roles_valid = true;
+        var result: [3]?[]const u8 = .{null} ** 3;
+        var payload_len: usize = 0;
         const allocator = self.sys.allocator();
         const jobs = allocator.alloc(InputJob, paths.len) catch return self.prepareInputs(paths, false);
         var joined = true;
         // An unconfirmed join retains every buffer until process teardown has
         // actually stopped its workers; it never frees an in-flight pointer.
         defer if (joined) allocator.free(jobs);
+        var waits: r4os.wait_set.Set = undefined;
+        if (r4os.wait_set.Set.init(&self.root.context, 3, &waits) != 0) return result;
+        defer _ = waits.close();
+        var registrations: [3]u64 = @splat(0);
+        var pending: usize = 0;
+        var wait_valid = true;
         for (paths, 0..) |path, index| {
-            jobs[index] = .{ .sys = self.sys, .path = path };
+            jobs[index] = .{ .owner = self, .path = path };
             if (path.len == 0) continue;
+            // Wide metadata is admitted only on the main task. Workers borrow
+            // the copied size; main revalidates identity after their real join.
+            jobs[index].before = self.readMetadata(path, max_file_bytes, restart);
+            if (jobs[index].before == null) continue;
             const rc = self.sys.computeWorkerCreate(InputJob.run, @intFromPtr(&jobs[index]), 256 * 1024, &jobs[index].handle);
             if (rc == r4os.abi.thread_ok) {
                 self.worker_count += 1;
+                var source: r4os.wait_set.Source = .{};
+                const prepared = r4os.wait_set.prepare(&self.root.context, r4os.wait_set.thread(jobs[index].handle, index + 1), &source);
+                const enrolled = if (prepared == 0) waits.enroll(source, &registrations[index]) else prepared;
+                if (enrolled != 0) {
+                    var message: [128]u8 = undefined;
+                    self.logLine(std.fmt.bufPrint(&message, "worker wait source index={d} prepare={d} enroll={d}", .{ index, prepared, enrolled }) catch "worker wait source failed");
+                    wait_valid = false;
+                } else pending += 1;
             } else {
-                // The old provider/UP contract and resource refusal retain a
-                // correct serial preparation without a hidden worker pool.
+                // Worker admission refusal retains serial input preparation.
                 jobs[index].handle = .{};
                 jobs[index].read();
+            }
+        }
+        while (pending != 0 and wait_valid and !self.root.shouldClose()) {
+            _ = budget.remainingTicks() catch break;
+            const deadline = r4os.wait_set.deadline(budget.deadline) catch break;
+            var events: [3]r4os.wait_set.Event = undefined;
+            var batch: r4os.wait_set.Batch = .{};
+            const waited = waits.wait(deadline, &events, &batch);
+            if (waited != 0 or batch.count == 0 or batch.count > events.len) {
+                var message: [128]u8 = undefined;
+                self.logLine(std.fmt.bufPrint(&message, "worker wait result={d} outcome={d} count={d}", .{ waited, batch.outcome, batch.count }) catch "worker wait failed");
+                break;
+            }
+            for (events[0..batch.count]) |event| {
+                if (event.user_tag == 0 or event.user_tag > registrations.len or event.kind != r4os.abi.waitset_source_thread or event.status != r4os.abi.waitset_event_ready) {
+                    var message: [128]u8 = undefined;
+                    self.logLine(std.fmt.bufPrint(&message, "worker event kind={d} status={d} tag={d}", .{ event.kind, event.status, event.user_tag }) catch "worker event invalid");
+                    wait_valid = false;
+                    break;
+                }
+                const index: usize = @intCast(event.user_tag - 1);
+                if (registrations[index] == 0 or event.registration != registrations[index] or waits.remove(event.registration) != 0) {
+                    wait_valid = false;
+                    break;
+                }
+                registrations[index] = 0;
+                pending -= 1;
             }
         }
         for (jobs) |*job| {
             if (job.handle.thread_id == 0) continue;
             var exit_code: i32 = -1;
-            if (self.sys.threadHandleJoin(&job.handle, self.sys.ticksFromMilliseconds(10_000), &exit_code) != r4os.abi.thread_ok or exit_code != 0) {
+            const remaining = budget.remainingTicks() catch 0;
+            if (self.sys.threadHandleJoin(&job.handle, remaining, &exit_code) != r4os.abi.thread_ok or exit_code != 0) {
                 joined = false;
             } else {
                 self.worker_roles_valid = self.worker_roles_valid and job.compute_role;
@@ -976,6 +1107,12 @@ const App = struct {
             _ = self.sys.programExit(1, r4os.abi.program_exit_reason_failed);
             while (true) self.sys.sleepTicks(1);
         }
+        const closed = waits.close();
+        if (!wait_valid or pending != 0 or self.root.shouldClose() or closed != 0) {
+            restart.* = false;
+            return result;
+        }
+        if (restart.*) return result;
         // Preserve the original code/rodata/data order, strict aggregate limit
         // and first error, regardless of worker completion order.
         for (jobs, 0..) |*job, index| {
@@ -984,6 +1121,7 @@ const App = struct {
                 continue;
             }
             const len = job.len orelse break;
+            if (!self.unchanged(job.path, job.before orelse break, restart)) break;
             if (len >= self.payload_buffer.len - payload_len) break;
             @memcpy(self.payload_buffer[payload_len..][0..len], job.buffer[0..len]);
             result[index] = self.payload_buffer[payload_len..][0..len];
@@ -994,9 +1132,21 @@ const App = struct {
 
     fn writeFile(self: *App, path: []const u8, data: []const u8) bool {
         var path_z: [path_capacity]u8 = .{0} ** path_capacity;
-        if (!setZResult(path_z[0..], path)) return false;
-        const written = self.sys.fileWrite(zptr(path_z[0..]), data);
-        return written >= 0 and @as(usize, @intCast(written)) == data.len;
+        if (!setZResult(path_z[0..], path) or self.root.shouldClose()) return false;
+        const name = zptr(path_z[0..]);
+        if (self.sys.fileStreamBegin(name, r4os.abi.file_stream_open_replace) != 0) return false;
+        var published = false;
+        defer {
+            if (!published) _ = self.sys.fileStreamAbort(name);
+        }
+        var target = r4os.stream_transfer.adapters.FileStream.fromContext2(&self.root.context, name, 0) catch return false;
+        var budget = r4os.rpc_budget.Budget.fromTimeout(self.output.clock.read, .{ .kind = 1, .nanoseconds = 5_000_000_000 }) catch return false;
+        const driver: r4os.stream_transfer.adapters.Driver = .{ .sys = self.sys, .clock = &self.output.clock, .budget = &budget };
+        const progress = driver.write(data, 64 * 1024, r4os.stream_transfer.adapters.FileStream.step, &target) catch return false;
+        if (progress.outcome != @intFromEnum(r4os.stream_transfer.Outcome.complete) or progress.bytes != data.len or self.root.shouldClose()) return false;
+        if (self.sys.fileStreamFinish(name, data.len, 0) != 0) return false;
+        published = true;
+        return true;
     }
 
     fn ensureDirectory(self: *App, path: []const u8) bool {
@@ -1010,8 +1160,10 @@ const App = struct {
     fn dirExists(self: *App, path: []const u8) bool {
         var path_z: [path_capacity]u8 = .{0} ** path_capacity;
         if (!setZResult(path_z[0..], path)) return false;
-        if (self.sys.fileInfo(zptr(path_z[0..]))) |info| return info.exists != 0 and info.is_dir != 0;
-        return false;
+        return switch (r4os.metadata2.info(&self.root.context, zptr(path_z[0..]))) {
+            .found => |value| value.flags & r4os.abi.file_metadata2_flag_directory != 0,
+            else => false,
+        };
     }
 
     fn resetLog(self: *App) void {
@@ -1032,16 +1184,26 @@ const App = struct {
     }
 
     fn logWrite(self: *App, text: []const u8) void {
-        self.sys.write(text);
         if (text.len == 0) return;
-        if (self.log_len >= self.log_buffer.len) {
-            self.log_overflow = true;
+        const available = self.log_buffer.len - self.log_len;
+        const count = @min(text.len, available);
+        @memcpy(self.log_buffer[self.log_len..][0..count], text[0..count]);
+        self.log_len += count;
+        self.log_overflow = self.log_overflow or count != text.len;
+        if (self.output.failed) return;
+        const accepted = self.records.appendRecord(text, .info) catch {
+            self.output.failed = true;
+            return;
+        };
+        if (accepted.kind != @intFromEnum(r4os.diagnostics.core.AppendKind.accepted)) {
+            self.output.failed = true;
             return;
         }
-        const writable = min(text.len, self.log_buffer.len - self.log_len);
-        if (writable < text.len) self.log_overflow = true;
-        @memcpy(self.log_buffer[self.log_len .. self.log_len + writable], text[0..writable]);
-        self.log_len += writable;
+        const sent = self.records.flushOnce(@intCast(text.len), r4os.launch_io.Output.recordSink, self.output) catch {
+            self.output.failed = true;
+            return;
+        };
+        if (sent.completed_records != 1) self.output.failed = true;
     }
 
     fn logUsize(self: *App, value: usize) void {
@@ -1366,12 +1528,11 @@ fn max_file_sections() u32 {
     return @intCast(max_inspect_sections);
 }
 
-fn takeToken(text: []const u8) ?Token {
-    const value = trim(text);
-    if (value.len == 0) return null;
-    var i: usize = 0;
-    while (i < value.len and !isSpace(value[i])) : (i += 1) {}
-    return .{ .token = value[0..i], .rest = trim(value[i..]) };
+fn takeToken(raw: []const u8) ?Token {
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(raw, .{}, &failure) catch return null;
+    const token = (cursor.next() catch return null) orelse return null;
+    return .{ .token = token.bytes(raw) catch return null, .rest = cursor.remainingArguments() catch return null };
 }
 
 fn parseU32(value: []const u8) ?u32 {

@@ -1,6 +1,21 @@
 ﻿R4Pack
 ======
 
-Eigenstaendiges R4OS-R4Code-Komponentenrepository. Das Repository besitzt
-den gemeinsamen Kern Shared/r4pack_core.zig und exportiert ihn als
-$(System.Collections.Hashtable.Export) fuer deklarierte Buildverbraucher.
+R4Pack besitzt Shared/r4pack_core.zig und exportiert den Kern als NamedLazyPath
+r4code_pack_core. Die Generation-2-Packpfade erzeugen Query2-Imports und den
+Export R4XStart2 mit Version2. Der R4M0-Eintragstyp bezeichnet die Modulrolle.
+
+Das Werkzeug verwendet App2, ArgCursor und begrenzte Diagnoserecords ueber
+seine gebundene Standardausgabe. Metadata2 wird im Hauptthread aufgerufen.
+Drei Compute-Worker leihen kopierte Dateigroessen und ihre privaten Puffer.
+Ein taskgebundenes WaitSet meldet Bereitschaft. Erst die echten Joins geben
+die Puffer frei. Danach prueft der Hauptthread Dateigroesse und Identitaet
+erneut. Alle Joins teilen dieselbe Gesamtfrist.
+Ein Metadaten-Restart verwirft die private Eingabegruppe nach bestaetigten
+Joins. Die Wiederaufnahme verwendet die verbleibende urspruengliche Frist.
+
+StreamTransfer bestaetigt genaue Praefixe. Die Ausgabe wird erst nach dem
+vollstaendigen Streamabschluss veroeffentlicht. Inspektion, Ressourcenlayout,
+Eingabereihenfolge und die bestehenden Fehlerpruefungen gehoeren zum Packer.
+Die neuen nativen Packpfade uebernehmen Modulname, Modulversion und die
+deklarierten Metadaten aus dem zuvor geprueften Projektmanifest.

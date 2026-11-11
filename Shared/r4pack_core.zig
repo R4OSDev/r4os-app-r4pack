@@ -41,19 +41,41 @@ pub const Resource = struct {
 
 const ImportSet = enum {
     console,
+    console_stdio,
     desktop_ok,
 };
 
 pub fn packConsoleR4X(module_name: []const u8, code: []const u8, resources: []const Resource, out: []u8) PackResult {
-    return packR4X(module_name, code, resources, out, R4X_FLAG_APP_CLASS_CONSOLE, "r4x.class=console", .console);
+    return packR4X(1, module_name, code, resources, out, R4X_FLAG_APP_CLASS_CONSOLE, "r4x.class=console", .console, null, &.{});
 }
 
 pub fn packDesktopOkR4X(module_name: []const u8, code: []const u8, resources: []const Resource, out: []u8) PackResult {
-    return packR4X(module_name, code, resources, out, R4X_FLAG_APP_CLASS_GUI, "r4x.class=gui", .desktop_ok);
+    return packR4X(1, module_name, code, resources, out, R4X_FLAG_APP_CLASS_GUI, "r4x.class=gui", .desktop_ok, null, &.{});
 }
 
-fn packR4X(module_name: []const u8, code: []const u8, resources: []const Resource, out: []u8, app_class_flag: u32, app_class_meta: []const u8, import_set: ImportSet) PackResult {
+pub fn packConsoleR4X2(module_name: []const u8, version: []const u8, code: []const u8, resources: []const Resource, metadata: []const []const u8, out: []u8) PackResult {
+    return packR4X(2, module_name, code, resources, out, R4X_FLAG_APP_CLASS_CONSOLE, "r4x.class=console", .console, version, metadata);
+}
+
+pub fn packConsoleStdioR4X2(module_name: []const u8, version: []const u8, code: []const u8, resources: []const Resource, metadata: []const []const u8, out: []u8) PackResult {
+    return packR4X(2, module_name, code, resources, out, R4X_FLAG_APP_CLASS_CONSOLE, "r4x.class=console", .console_stdio, version, metadata);
+}
+
+pub fn packDesktopOkR4X2(module_name: []const u8, version: []const u8, code: []const u8, resources: []const Resource, metadata: []const []const u8, out: []u8) PackResult {
+    return packR4X(2, module_name, code, resources, out, R4X_FLAG_APP_CLASS_GUI, "r4x.class=gui", .desktop_ok, version, metadata);
+}
+
+fn packR4X(comptime generation: u8, module_name: []const u8, code: []const u8, resources: []const Resource, out: []u8, app_class_flag: u32, app_class_meta: []const u8, import_set: ImportSet, version: ?[]const u8, metadata: []const []const u8) PackResult {
+    const start_symbol = if (generation == 2) "R4XStart2" else "R4XStart";
+    const start_metadata = if (generation == 2) "r4x.start=r4xstart2" else "r4x.start=r4xstart";
+    const entry_metadata = if (generation == 2) "r4x.entry=R4XStart2" else "r4x.entry=R4XStart";
+    const abi_metadata = if (generation == 2) "r4x.start_abi=2" else "r4x.start_abi=1";
+    const context_metadata = if (generation == 2) "r4x.context=R4XStartContext2" else "r4x.context=R4XStartContext";
     if (module_name.len == 0) return fail("missing module name");
+    var name_buffer: [256]u8 = undefined;
+    const name_metadata = if (generation == 2) @import("std").fmt.bufPrint(&name_buffer, "r4x.name={s}", .{module_name}) catch return fail("module name too long") else module_name;
+    var version_buffer: [64]u8 = undefined;
+    const version_metadata = if (version) |text| @import("std").fmt.bufPrint(&version_buffer, "module.version={s}", .{text}) catch return fail("module version too long") else "";
     if (code.len == 0) return fail("missing code");
     if (validateResources(resources)) |message| return fail(message);
     const rsrc_len = resourceSectionLength(resources);
@@ -74,18 +96,20 @@ fn packR4X(module_name: []const u8, code: []const u8, resources: []const Resourc
     const string_off = rsrc_off + rsrc_len;
 
     var string_len: usize = 0;
-    string_len += module_name.len + 1;
+    string_len += name_metadata.len + 1;
+    if (version != null) string_len += version_metadata.len + 1;
+    for (metadata) |entry| string_len += entry.len + 1;
     var import_index: usize = 0;
     while (import_index < import_count) : (import_index += 1) {
         string_len += importModule(import_set, import_index).len + 1;
-        string_len += importSymbol(import_set, import_index).len + 1;
+        string_len += importSymbol(generation, import_set, import_index).len + 1;
     }
-    string_len += "R4XStart".len + 1;
+    string_len += start_symbol.len + 1;
     string_len += app_class_meta.len + 1;
-    string_len += "r4x.start=r4xstart".len + 1;
-    string_len += "r4x.entry=R4XStart".len + 1;
-    string_len += "r4x.start_abi=1".len + 1;
-    string_len += "r4x.context=R4XStartContext".len + 1;
+    string_len += start_metadata.len + 1;
+    string_len += entry_metadata.len + 1;
+    string_len += abi_metadata.len + 1;
+    string_len += context_metadata.len + 1;
     string_len += "generated_by=R4CC-r4mf-v2".len + 1;
 
     const total_len = string_off + string_len;
@@ -97,7 +121,7 @@ fn packR4X(module_name: []const u8, code: []const u8, resources: []const Resourc
     if (has_rsrc) writeResourceSection(image[rsrc_off .. rsrc_off + rsrc_len], resources);
 
     var strings = string_off;
-    const module_name_off: u32 = @intCast(putZ(image, &strings, module_name));
+    const module_name_off: u32 = @intCast(putZ(image, &strings, name_metadata));
     _ = module_name_off;
     var import_module_offs: [3]u32 = undefined;
     var import_symbol_offs: [3]u32 = undefined;
@@ -105,15 +129,17 @@ fn packR4X(module_name: []const u8, code: []const u8, resources: []const Resourc
     import_index = 0;
     while (import_index < import_count) : (import_index += 1) {
         import_module_offs[import_index] = @intCast(putZ(image, &strings, importModule(import_set, import_index)));
-        import_symbol_offs[import_index] = @intCast(putZ(image, &strings, importSymbol(import_set, import_index)));
+        import_symbol_offs[import_index] = @intCast(putZ(image, &strings, importSymbol(generation, import_set, import_index)));
     }
-    const export_name_off: u32 = @intCast(putZ(image, &strings, "R4XStart"));
+    const export_name_off: u32 = @intCast(putZ(image, &strings, start_symbol));
     _ = putZ(image, &strings, app_class_meta);
-    _ = putZ(image, &strings, "r4x.start=r4xstart");
-    _ = putZ(image, &strings, "r4x.entry=R4XStart");
-    _ = putZ(image, &strings, "r4x.start_abi=1");
-    _ = putZ(image, &strings, "r4x.context=R4XStartContext");
+    _ = putZ(image, &strings, start_metadata);
+    _ = putZ(image, &strings, entry_metadata);
+    _ = putZ(image, &strings, abi_metadata);
+    _ = putZ(image, &strings, context_metadata);
     _ = putZ(image, &strings, "generated_by=R4CC-r4mf-v2");
+    if (version != null) _ = putZ(image, &strings, version_metadata);
+    for (metadata) |entry| _ = putZ(image, &strings, entry);
 
     @memcpy(image[0..4], "R4M0");
     wU16(image, 4, R4M_VERSION);
@@ -138,6 +164,7 @@ fn packR4X(module_name: []const u8, code: []const u8, resources: []const Resourc
     if (has_rsrc) {
         writeSection(image, section_off + R4M_SECTION_SIZE, ".rsrc", 0, @intCast(rsrc_off), @intCast(rsrc_len), @intCast(rsrc_len), 16);
     }
+    // Entry kind identifies the module role independently of its start ABI.
     wU32(image, entry_off + 0, ENTRY_KIND_R4X);
     wU32(image, entry_off + 4, 0);
     wU32(image, entry_off + 8, 0);
@@ -148,14 +175,14 @@ fn packR4X(module_name: []const u8, code: []const u8, resources: []const Resourc
         const off = import_off + import_index * R4M_IMPORT_SIZE;
         wU32(image, off + 0, import_module_offs[import_index]);
         wU32(image, off + 4, import_symbol_offs[import_index]);
-        wU32(image, off + 8, importMinVersion(import_set, import_index));
+        wU32(image, off + 8, importMinVersion(generation, import_set, import_index));
         wU32(image, off + 12, importFlags(import_set, import_index));
     }
 
     wU32(image, export_off + 0, export_name_off);
     wU32(image, export_off + 4, 0);
     wU32(image, export_off + 8, 0);
-    wU32(image, export_off + 12, 1);
+    wU32(image, export_off + 12, generation);
 
     return .{ .ok = true, .bytes = image };
 }
@@ -306,6 +333,7 @@ fn rU32(bytes: []const u8, off: usize) u32 {
 fn importCount(import_set: ImportSet) usize {
     return switch (import_set) {
         .console => 1,
+        .console_stdio => 2,
         .desktop_ok => 3,
     };
 }
@@ -313,7 +341,7 @@ fn importCount(import_set: ImportSet) usize {
 fn importModule(import_set: ImportSet, index: usize) []const u8 {
     return switch (import_set) {
         .console => "R4SYS",
-        .desktop_ok => switch (index) {
+        .console_stdio, .desktop_ok => switch (index) {
             0 => "R4SYS",
             1 => "R4DESK",
             2 => "R4DRAW",
@@ -322,16 +350,16 @@ fn importModule(import_set: ImportSet, index: usize) []const u8 {
     };
 }
 
-fn importSymbol(import_set: ImportSet, index: usize) []const u8 {
+fn importSymbol(comptime generation: u8, import_set: ImportSet, index: usize) []const u8 {
     _ = import_set;
     _ = index;
-    return "Query";
+    return if (generation == 2) "Query2" else "Query";
 }
 
-fn importMinVersion(import_set: ImportSet, index: usize) u32 {
+fn importMinVersion(comptime generation: u8, import_set: ImportSet, index: usize) u32 {
     _ = import_set;
     _ = index;
-    return 1;
+    return generation;
 }
 
 fn importFlags(import_set: ImportSet, index: usize) u32 {

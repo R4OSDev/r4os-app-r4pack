@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.5`
+- Version: `0.1.7`
 - Image target: `/SOFTWARE/R4CODE/R4PACK.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -22,19 +22,20 @@ On Linux:
 
     ./Build.sh
 
-The build starters resolve the current local R4OS dependency checkouts through
-`Settings.R4S`. The URL and hash entries in `build.zig.zon` record the
-last verified standalone dependency identities; workspace builds use the
-mapped local checkouts.
+The build starters verify the pinned SDK and its matched Contract, Libraries
+and host tools. `build.zig.zon` records the standalone package identities.
 
 ## Documentation
 
 Independent code, rodata and data inputs are prepared by explicitly declared
-compute workers (`runtime.workers=owned-v1`). The foreground caller joins them,
-then preserves the canonical section order, aggregate size limit, first input
-error and package bytes. Workers do not print or own the console. Code-only
+compute workers (`runtime.workers=owned-v1`). The foreground caller collects
+wide metadata, enrolls exact worker identities in a task-owned WaitSet and
+joins every worker within one shared deadline. After confirmed joins it
+revalidates file identities and preserves section order, aggregate size limit,
+first input error and package bytes. Workers borrow the copied sizes and
+perform bounded reads. Code-only
 commands stay serial; `--serial` selects the same serial preparation explicitly.
-An older provider or refused worker creation falls back to serial preparation.
+Refused worker creation uses serial preparation.
 An unconfirmed join requests terminal process exit while retaining its buffers
 and complete main frame through the actual worker stop.
 
