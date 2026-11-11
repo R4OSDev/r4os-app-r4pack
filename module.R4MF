@@ -10,6 +10,7 @@ APP_CLASS=console
 TARGET=/SOFTWARE/R4CODE/R4PACK.R4X
 IMAGE_SCOPE=full
 PACKAGE=R4CODE
+ZIG_MODULE=r4code_pack_core:Shared/r4pack_core.zig
 IMPORT=R4SYS:Query2:2
 IMPORT=R4DESK:Query2:2
 META=memory.profile=build-tool

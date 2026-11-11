@@ -19,3 +19,9 @@ vollstaendigen Streamabschluss veroeffentlicht. Inspektion, Ressourcenlayout,
 Eingabereihenfolge und die bestehenden Fehlerpruefungen gehoeren zum Packer.
 Die neuen nativen Packpfade uebernehmen Modulname, Modulversion und die
 deklarierten Metadaten aus dem zuvor geprueften Projektmanifest.
+Der CLI-Packer leitet die vier Start2-Metadaten aus einem ausdruecklichen
+R4XStart2-Export mit Version2 ab. Bereits angegebene Werte werden geprueft.
+Widersprueche, doppelte Identitaeten und gemischte Plattformgenerationen
+werden vor dem Lesen oder Ersetzen der Ausgabedatei abgewiesen. Damit passt
+ein vollstaendiger Console-Packaufruf mit relativen Pfaden in die vorhandene
+127-Byte-Argumentgrenze der Programmstart-API.

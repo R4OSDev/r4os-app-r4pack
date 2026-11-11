@@ -1,5 +1,6 @@
 const std = @import("std");
 const r4os = @import("r4os");
+const pack_core = @import("r4code_pack_core");
 
 const R4M_HEADER_SIZE: usize = 64;
 const R4M_SECTION_SIZE: usize = 32;
@@ -265,7 +266,8 @@ const App = struct {
         self.logLine("  --serial keeps independent input preparation on the caller");
     }
 
-    fn pack(self: *App, opts: Options) bool {
+    fn pack(self: *App, requested: Options) bool {
+        var opts = requested;
         if (opts.out.len == 0) {
             self.logLine("error: --output missing");
             return false;
@@ -278,6 +280,7 @@ const App = struct {
             self.logLine("error: module name missing");
             return false;
         }
+        if (!self.bindStart2(&opts)) return false;
 
         const inputs = self.prepareInputs(.{ opts.code_path, opts.rodata_path, opts.data_path }, !opts.serial);
         const code = inputs[0] orelse {
@@ -339,6 +342,53 @@ const App = struct {
         }
 
         return self.writeR4M(opts, sections[0..section_count]);
+    }
+
+    fn bindStart2(self: *App, opts: *Options) bool {
+        if (opts.kind != .r4x) return true;
+        var has_start2 = false;
+        var has_start1 = false;
+        for (opts.exports[0..opts.export_count]) |entry| {
+            if (bytesEqual(entry.name, "R4XStart")) has_start1 = true;
+            if (bytesEqual(entry.name, r4os.platform2.abi.start_symbol)) {
+                if (has_start2 or entry.version != r4os.platform2.abi.start_version) {
+                    self.logLine("error: invalid or duplicate Start2 export");
+                    return false;
+                }
+                has_start2 = true;
+            }
+        }
+        if (!has_start2) return true;
+        if (has_start1) {
+            self.logLine("error: mixed start generations");
+            return false;
+        }
+        for (opts.imports[0..opts.import_count]) |entry| {
+            if (r4os.r4mf.platformApiGroupId(entry.module) != null and !bytesEqual(entry.symbol, r4os.platform2.abi.query_symbol)) {
+                self.logLine("error: Start2 requires generation2 platform imports");
+                return false;
+            }
+        }
+        for (pack_core.start2_metadata) |required| {
+            const key_end = (std.mem.indexOfScalar(u8, required, '=') orelse unreachable) + 1;
+            var present = false;
+            for (opts.metadata[0..opts.metadata_count]) |entry| {
+                if (!startsWith(entry, required[0..key_end])) continue;
+                if (present or !bytesEqual(entry, required)) {
+                    self.logLine("error: conflicting or duplicate Start2 metadata");
+                    return false;
+                }
+                present = true;
+            }
+            if (present) continue;
+            if (opts.metadata_count == opts.metadata.len) {
+                self.logLine("error: no capacity for Start2 metadata");
+                return false;
+            }
+            opts.metadata[opts.metadata_count] = required;
+            opts.metadata_count += 1;
+        }
+        return true;
     }
 
     fn writeR4M(self: *App, opts: Options, sections: []const InputSection) bool {
@@ -816,6 +866,31 @@ const App = struct {
         opts.metadata[5] = copyText(meta_buffers[5][0..], "r4x.start_abi=2");
         opts.metadata[6] = copyText(meta_buffers[6][0..], "r4x.context=R4XStartContext2");
         opts.metadata_count = 7;
+
+        var derived = opts;
+        derived.metadata_count = 0;
+        if (!self.bindStart2(&derived) or derived.metadata_count != pack_core.start2_metadata.len) return 1;
+        for (derived.metadata[0..derived.metadata_count], pack_core.start2_metadata) |actual, expected| {
+            if (!bytesEqual(actual, expected)) return 1;
+        }
+        var invalid_start = derived;
+        invalid_start.metadata[0] = "r4x.start=r4xstart";
+        if (self.bindStart2(&invalid_start)) return 1;
+        invalid_start = derived;
+        invalid_start.metadata[invalid_start.metadata_count] = pack_core.start2_metadata[0];
+        invalid_start.metadata_count += 1;
+        if (self.bindStart2(&invalid_start)) return 1;
+        invalid_start = derived;
+        invalid_start.exports[0].version = 1;
+        if (self.bindStart2(&invalid_start)) return 1;
+        invalid_start = derived;
+        invalid_start.exports[1] = .{ .name = "R4XStart", .section = null, .offset = 0, .version = 1 };
+        invalid_start.export_count = 2;
+        if (self.bindStart2(&invalid_start)) return 1;
+        invalid_start = derived;
+        invalid_start.imports[0].symbol = "Query";
+        if (self.bindStart2(&invalid_start)) return 1;
+        self.logLine("R4PACK Start2 derive=OK conflict/duplicate/revision/mixed-import=OK");
 
         if (!self.pack(opts)) return 1;
         const reference = self.sys.allocator().alloc(u8, max_file_bytes) catch return 1;

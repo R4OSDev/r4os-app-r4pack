@@ -47,6 +47,12 @@ Inspection allocates the actual file size, bounded at16 MB, independently of
 the unchanged64 KB CLI pack/input limit. The full self-inspection remains part
 of the original selftest even when this tool's own artifact exceeds64 KB.
 
+An explicit `R4XStart2` export at revision2 derives the complete four-field
+start identity. Explicit identity fields are checked for consistency and
+duplicates before output publication. Relative paths and the existing
+`R4XStart2:0:2` export form keep console pack commands within the program
+launch API's 127-byte argument bound.
+
 Detailed German technical notes from the migration are preserved in
 `DOCUMENTATION.de.txt`. Source-transfer provenance is recorded in
 `PROVENANCE.txt`.

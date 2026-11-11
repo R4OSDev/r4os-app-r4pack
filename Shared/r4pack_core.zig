@@ -2,6 +2,13 @@ pub const max_r4x_bytes: usize = 8 * 1024;
 /// In-Guest-Grenze fuer den Ressourcenbereich eines gepackten Moduls.
 pub const max_rsrc_bytes: usize = 16 * 1024;
 
+pub const start2_metadata = [_][]const u8{
+    "r4x.start=r4xstart2",
+    "r4x.entry=R4XStart2",
+    "r4x.start_abi=2",
+    "r4x.context=R4XStartContext2",
+};
+
 const R4M_HEADER_SIZE: usize = 64;
 const R4M_SECTION_SIZE: usize = 32;
 const R4M_ENTRY_SIZE: usize = 16;
@@ -67,10 +74,10 @@ pub fn packDesktopOkR4X2(module_name: []const u8, version: []const u8, code: []c
 
 fn packR4X(comptime generation: u8, module_name: []const u8, code: []const u8, resources: []const Resource, out: []u8, app_class_flag: u32, app_class_meta: []const u8, import_set: ImportSet, version: ?[]const u8, metadata: []const []const u8) PackResult {
     const start_symbol = if (generation == 2) "R4XStart2" else "R4XStart";
-    const start_metadata = if (generation == 2) "r4x.start=r4xstart2" else "r4x.start=r4xstart";
-    const entry_metadata = if (generation == 2) "r4x.entry=R4XStart2" else "r4x.entry=R4XStart";
-    const abi_metadata = if (generation == 2) "r4x.start_abi=2" else "r4x.start_abi=1";
-    const context_metadata = if (generation == 2) "r4x.context=R4XStartContext2" else "r4x.context=R4XStartContext";
+    const start_metadata = if (generation == 2) start2_metadata[0] else "r4x.start=r4xstart";
+    const entry_metadata = if (generation == 2) start2_metadata[1] else "r4x.entry=R4XStart";
+    const abi_metadata = if (generation == 2) start2_metadata[2] else "r4x.start_abi=1";
+    const context_metadata = if (generation == 2) start2_metadata[3] else "r4x.context=R4XStartContext";
     if (module_name.len == 0) return fail("missing module name");
     var name_buffer: [256]u8 = undefined;
     const name_metadata = if (generation == 2) @import("std").fmt.bufPrint(&name_buffer, "r4x.name={s}", .{module_name}) catch return fail("module name too long") else module_name;
