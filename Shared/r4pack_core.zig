@@ -52,14 +52,6 @@ const ImportSet = enum {
     desktop_ok,
 };
 
-pub fn packConsoleR4X(module_name: []const u8, code: []const u8, resources: []const Resource, out: []u8) PackResult {
-    return packR4X(1, module_name, code, resources, out, R4X_FLAG_APP_CLASS_CONSOLE, "r4x.class=console", .console, null, &.{});
-}
-
-pub fn packDesktopOkR4X(module_name: []const u8, code: []const u8, resources: []const Resource, out: []u8) PackResult {
-    return packR4X(1, module_name, code, resources, out, R4X_FLAG_APP_CLASS_GUI, "r4x.class=gui", .desktop_ok, null, &.{});
-}
-
 pub fn packConsoleR4X2(module_name: []const u8, version: []const u8, code: []const u8, resources: []const Resource, metadata: []const []const u8, out: []u8) PackResult {
     return packR4X(2, module_name, code, resources, out, R4X_FLAG_APP_CLASS_CONSOLE, "r4x.class=console", .console, version, metadata);
 }
@@ -73,14 +65,17 @@ pub fn packDesktopOkR4X2(module_name: []const u8, version: []const u8, code: []c
 }
 
 fn packR4X(comptime generation: u8, module_name: []const u8, code: []const u8, resources: []const Resource, out: []u8, app_class_flag: u32, app_class_meta: []const u8, import_set: ImportSet, version: ?[]const u8, metadata: []const []const u8) PackResult {
-    const start_symbol = if (generation == 2) "R4XStart2" else "R4XStart";
-    const start_metadata = if (generation == 2) start2_metadata[0] else "r4x.start=r4xstart";
-    const entry_metadata = if (generation == 2) start2_metadata[1] else "r4x.entry=R4XStart";
-    const abi_metadata = if (generation == 2) start2_metadata[2] else "r4x.start_abi=1";
-    const context_metadata = if (generation == 2) start2_metadata[3] else "r4x.context=R4XStartContext";
+    comptime {
+        if (generation != 2) @compileError("Only current native executable packing is supported");
+    }
+    const start_symbol = "R4XStart2";
+    const start_metadata = start2_metadata[0];
+    const entry_metadata = start2_metadata[1];
+    const abi_metadata = start2_metadata[2];
+    const context_metadata = start2_metadata[3];
     if (module_name.len == 0) return fail("missing module name");
     var name_buffer: [256]u8 = undefined;
-    const name_metadata = if (generation == 2) @import("std").fmt.bufPrint(&name_buffer, "r4x.name={s}", .{module_name}) catch return fail("module name too long") else module_name;
+    const name_metadata = @import("std").fmt.bufPrint(&name_buffer, "r4x.name={s}", .{module_name}) catch return fail("module name too long");
     var version_buffer: [64]u8 = undefined;
     const version_metadata = if (version) |text| @import("std").fmt.bufPrint(&version_buffer, "module.version={s}", .{text}) catch return fail("module version too long") else "";
     if (code.len == 0) return fail("missing code");
@@ -357,10 +352,10 @@ fn importModule(import_set: ImportSet, index: usize) []const u8 {
     };
 }
 
-fn importSymbol(comptime generation: u8, import_set: ImportSet, index: usize) []const u8 {
+fn importSymbol(comptime _: u8, import_set: ImportSet, index: usize) []const u8 {
     _ = import_set;
     _ = index;
-    return if (generation == 2) "Query2" else "Query";
+    return "Query2";
 }
 
 fn importMinVersion(comptime generation: u8, import_set: ImportSet, index: usize) u32 {

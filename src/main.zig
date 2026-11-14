@@ -159,7 +159,7 @@ const App = struct {
             return 1;
         }) |_| {}
 
-        self.logLine("R4PACK 0.1.7");
+        self.logLine("R4PACK 0.1.8");
         if (args.len == 0 or equalsIgnoreCase(args, "HELP") or equalsIgnoreCase(args, "/?")) {
             self.printUsage();
             return 0;
